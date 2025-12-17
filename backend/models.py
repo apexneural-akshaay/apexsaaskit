@@ -1,5 +1,5 @@
 from sqlalchemy import Column, String, Boolean, Integer, Float, ForeignKey
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 try:
     from apex import Model, ID, Timestamps, register_model
@@ -29,17 +29,22 @@ class User(Model, ID, Timestamps):
 @register_model
 class Payment(Model, ID, Timestamps):
     __tablename__ = "payments"
-    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    order_id = Column(String(255), unique=True, nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)  # Made nullable for initial creation
+    order_id = Column(String(255), unique=True, nullable=True, index=True)  # Made nullable since paypal_order_id is the primary
     amount = Column(Float, nullable=False)
     currency = Column(String(10), default="USD", nullable=False)
     description = Column(String(500), nullable=True)
     status = Column(String(50), default="pending", nullable=False, index=True)
-    paypal_order_id = Column(String(255), nullable=True, index=True)
+    paypal_order_id = Column(String(255), unique=True, nullable=True, index=True)  # Primary identifier from PayPal
     paypal_capture_id = Column(String(255), nullable=True)
     return_url = Column(String(500), nullable=True)
     cancel_url = Column(String(500), nullable=True)
     approval_url = Column(String(500), nullable=True)
+    payment_method = Column(String(50), default="paypal", nullable=False)  # Required by Apex
+    payment_metadata = Column(JSONB, nullable=True)  # Required by Apex
+    organization_id = Column(UUID(as_uuid=False), nullable=True)  # Required by Apex (can be null)
+    meta = Column(JSONB, nullable=True)  # Required by Apex
+    user_email = Column(String(255), nullable=True, index=True) # Added for easier querying
     
     # Relationship: each payment belongs to one user
     user = relationship("User", back_populates="payments", lazy="selectin")

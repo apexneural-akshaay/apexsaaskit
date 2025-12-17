@@ -53,11 +53,32 @@ async def login_user(email, password):
         _executor,
         lambda: login(email=email, password=password)
     )
-    return {
-        "access_token": tokens["access_token"],
-        "refresh_token": tokens["refresh_token"],
-        "token_type": tokens["token_type"]
-    }
+    
+    # After successful login, fetch user details from DB to get user_id
+    from apex.infrastructure.database import engine
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+    from sqlalchemy import select
+    from models import User
+    
+    async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with async_session() as session:
+        stmt = select(User).where(User.email == email)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+        
+        if user:
+            return {
+                "access_token": tokens["access_token"],
+                "refresh_token": tokens["refresh_token"],
+                "token_type": tokens["token_type"],
+                "user_id": str(user.id),
+                "email": user.email,
+                "first_name": user.first_name,
+                "username": user.username
+            }
+        else:
+            # This case should ideally not happen if login was successful
+            raise Exception("User not found after successful login")
 
 async def forgot_password_user(email):
     """
