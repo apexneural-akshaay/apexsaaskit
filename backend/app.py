@@ -1,9 +1,11 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 from apex import Client, set_default_client, bootstrap
 from apex.email import send_email
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, EmailStr
 from models import User, Payment
 import auth
@@ -42,6 +44,10 @@ PAYPAL_MODE = os.getenv('PAYPAL_MODE', 'sandbox')
 
 # Frontend URL for CORS and payment redirects
 FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
+
+# Files directory for downloadable materials
+FILES_DIR = Path(__file__).parent / "files"
+FILES_DIR.mkdir(exist_ok=True)  # Create directory if it doesn't exist
 
 # Initialize Apex Client (following documentation pattern)
 # Client only accepts: database_url, user_model, secret_key
@@ -372,6 +378,10 @@ async def capture_order_endpoint(request: CaptureOrderRequest):
             user_id=request.user_id
         )
         
+        # Debug: log capture result
+        print(f"🔍 Capture result: {result}")
+        print(f"🔍 Capture result keys: {result.keys() if isinstance(result, dict) else 'Not a dict'}")
+        
         # Find payment by order_id and link to logged-in user
         # This ensures payment is linked to the user who generated the link, not PayPal email
         from apex.infrastructure.database import engine
@@ -427,13 +437,29 @@ async def capture_order_endpoint(request: CaptureOrderRequest):
             else:
                 print(f"⚠️ Payment not found for order_id: {request.order_id}")
                 # If payment not found, try to create it (fallback)
-                if request.user_id and result.get('amount'):
+                if request.user_id:
                     try:
+                        # Try to get amount from capture result, or fetch from order if missing
+                        amount = result.get('amount')
+                        currency = result.get('currency', 'USD')
+                        
+                        # If amount is missing, try to fetch order details
+                        if not amount:
+                            print(f"⚠️ Amount missing in capture result, fetching order details...")
+                            try:
+                                order_details = await payments.get_payment_order(request.order_id)
+                                amount = order_details.get('amount')
+                                currency = order_details.get('currency', 'USD')
+                                print(f"✅ Fetched order details: amount={amount}, currency={currency}")
+                            except Exception as e:
+                                print(f"⚠️ Failed to fetch order details: {e}")
+                        
+                        # Create payment record even if amount is missing (we'll update it later)
                         new_payment = Payment(
                             order_id=request.order_id,
                             paypal_order_id=request.order_id,
-                            amount=float(result.get('amount', 0)),
-                            currency=result.get('currency', 'USD'),
+                            amount=float(amount) if amount else 0.0,
+                            currency=currency,
                             status=result.get('status', 'completed').lower(),
                             user_id=request.user_id,
                             user_email=request.user_email, # Store user email
@@ -444,12 +470,14 @@ async def capture_order_endpoint(request: CaptureOrderRequest):
                         )
                         session.add(new_payment)
                         await session.commit()
-                        print(f"✅ Created new payment record for order_id: {request.order_id}, user_id: {request.user_id}")
+                        print(f"✅ Created new payment record for order_id: {request.order_id}, user_id: {request.user_id}, amount: {amount}")
                     except Exception as e:
                         print(f"❌ Failed to create payment record: {e}")
                         import traceback
                         traceback.print_exc()
                         await session.rollback()
+                else:
+                    print(f"⚠️ Cannot create payment record: user_id is missing")
         
         return result
     except Exception as e:
@@ -558,6 +586,117 @@ async def get_user_id_endpoint(email: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch user: {str(e)}")
+
+@app.get("/materials/available")
+async def get_available_materials(user_id: str):
+    """Get list of materials user can download based on their payments"""
+    try:
+        from apex.infrastructure.database import engine
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+        from sqlalchemy import select
+        from models import Payment
+        
+        async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with async_session() as session:
+            # Get all completed payments for this user
+            stmt = select(Payment).where(
+                Payment.user_id == user_id,
+                Payment.status.in_(["completed", "COMPLETED"])
+            )
+            result = await session.execute(stmt)
+            completed_payments = result.scalars().all()
+            
+            # Check which plans user has
+            has_starter = any(p.amount == 99.0 for p in completed_payments)
+            has_pro = any(p.amount == 199.0 for p in completed_payments)
+            
+            available_files = []
+            
+            if has_starter:
+                available_files.append({
+                    "filename": "ID.pdf",
+                    "name": "ID Document",
+                    "plan": "Starter"
+                })
+            
+            if has_pro:
+                available_files.append({
+                    "filename": "AKSHAAY.pdf",
+                    "name": "AKSHAAY Resume",
+                    "plan": "Pro"
+                })
+            
+            return {
+                "has_access": len(available_files) > 0,
+                "files": available_files,
+                "has_starter": has_starter,
+                "has_pro": has_pro
+            }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to check materials: {str(e)}")
+
+@app.get("/materials/download/{filename}")
+async def download_material(filename: str, user_id: str):
+    """Download a material file with access control"""
+    try:
+        # Validate filename to prevent path traversal
+        allowed_files = ["ID.pdf", "AKSHAAY.pdf"]
+        if filename not in allowed_files:
+            raise HTTPException(status_code=400, detail="Invalid file name")
+        
+        # Check user's payment status
+        from apex.infrastructure.database import engine
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+        from sqlalchemy import select
+        from models import Payment
+        
+        async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with async_session() as session:
+            # Get all completed payments for this user
+            stmt = select(Payment).where(
+                Payment.user_id == user_id,
+                Payment.status.in_(["completed", "COMPLETED"])
+            )
+            result = await session.execute(stmt)
+            completed_payments = result.scalars().all()
+            
+            # Check which plans user has
+            has_starter = any(p.amount == 99.0 for p in completed_payments)
+            has_pro = any(p.amount == 199.0 for p in completed_payments)
+            
+            # Check access based on file and plan
+            if filename == "ID.pdf" and not has_starter:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied. You need to purchase the Starter plan ($99) to download this file."
+                )
+            
+            if filename == "AKSHAAY.pdf" and not has_pro:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied. You need to purchase the Pro plan ($199) to download this file."
+                )
+            
+            # File path
+            file_path = FILES_DIR / filename
+            
+            if not file_path.exists():
+                raise HTTPException(status_code=404, detail="File not found on server")
+            
+            # Return file
+            return FileResponse(
+                path=file_path,
+                filename=filename,
+                media_type='application/pdf'
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to download file: {str(e)}")
 
 @app.get("/")
 async def root():

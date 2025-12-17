@@ -82,18 +82,41 @@ async def login_user(email, password):
 
 async def forgot_password_user(email):
     """
-    Request password reset using apex.auth.forgot_password
-    Following docs: user, reset_token = forgot_password(email="...")
+    Request password reset - manually generate token to avoid duplicate emails
+    Only sends email with FRONTEND_URL from .env
     """
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(
-        _executor,
-        lambda: forgot_password(email=email)
-    )
-    user, reset_token = result
+    from apex.infrastructure.database import engine
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+    from sqlalchemy import select
+    from models import User
+    import secrets
+    from datetime import datetime, timedelta
     
-    if user and reset_token:
-        # Create reset link
+    loop = asyncio.get_running_loop()
+    
+    # Get user from database
+    async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with async_session() as session:
+        stmt = select(User).where(User.email == email)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+        
+        if not user:
+            return None
+        
+        # Generate reset token manually (similar to what Apex does)
+        reset_token = secrets.token_urlsafe(32)
+        
+        # Set token expiration (1 hour from now)
+        expires_at = datetime.utcnow() + timedelta(hours=1)
+        
+        # Update user with reset token
+        user.reset_token = reset_token
+        user.reset_token_expires = expires_at.isoformat()
+        
+        await session.commit()
+        
+        # Create reset link using FRONTEND_URL from .env
         reset_link = f"{FRONTEND_URL}/reset-password?token={reset_token}"
         
         # Email content with clickable reset link
@@ -135,7 +158,7 @@ This link will expire after a certain period for security reasons.
 </html>
 """
         
-        # Send email with reset link using apex.email
+        # Send email with reset link using apex.email (only our custom email)
         await loop.run_in_executor(
             _executor,
             lambda: send_email(
@@ -145,11 +168,11 @@ This link will expire after a certain period for security reasons.
                 html=email_html
             )
         )
+        
         return {
             "message": "Password reset email sent",
             "reset_token": reset_token  # In production, don't return token
         }
-    return None
 
 async def reset_password_user(token, new_password):
     """
