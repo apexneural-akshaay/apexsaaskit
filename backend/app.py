@@ -45,8 +45,16 @@ PAYPAL_MODE = os.getenv('PAYPAL_MODE', 'sandbox')
 # Frontend URL for CORS and payment redirects
 FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
 
+# Plan Configuration from Environment Variables
+STARTER_PLAN_FILE = os.getenv('STARTER_PLAN_FILE', 'ID.pdf')
+PRO_PLAN_FILE = os.getenv('PRO_PLAN_FILE', 'AKSHAAY.pdf')
+
+# Plan Prices from Environment Variables
+STARTER_PLAN_PRICE = float(os.getenv('STARTER_PLAN_PRICE', '99.0'))
+PRO_PLAN_PRICE = float(os.getenv('PRO_PLAN_PRICE', '199.0'))
+
 # Files directory for downloadable materials
-FILES_DIR = Path(__file__).parent / "files"
+FILES_DIR = Path(os.getenv('FILES_DIR', str(Path(__file__).parent / "files")))
 FILES_DIR.mkdir(exist_ok=True)  # Create directory if it doesn't exist
 
 # Initialize Apex Client (following documentation pattern)
@@ -319,9 +327,19 @@ async def create_order_endpoint(request: CreateOrderRequest):
                 result = await session.execute(stmt)
                 completed_payments = result.scalars().all()
                 
-                # Check if user has Pro plan ($199)
-                has_pro = any(p.amount == 199.0 for p in completed_payments)
-                has_starter = any(p.amount == 99.0 for p in completed_payments)
+                # Check if user has Pro plan - check current price OR historical prices
+                has_pro = any(
+                    p.amount == PRO_PLAN_PRICE or 
+                    p.amount == 199.0 or 
+                    abs(p.amount - 199.0) < 0.01
+                    for p in completed_payments
+                )
+                has_starter = any(
+                    p.amount == STARTER_PLAN_PRICE or 
+                    p.amount == 99.0 or 
+                    abs(p.amount - 99.0) < 0.01
+                    for p in completed_payments
+                )
                 
                 # Validation rules based on foreign key relationship
                 if has_pro:
@@ -330,13 +348,13 @@ async def create_order_endpoint(request: CreateOrderRequest):
                         detail="You already have the Pro plan. No additional payments allowed."
                     )
                 
-                if request.amount == 99.0 and has_starter:
+                if request.amount == STARTER_PLAN_PRICE and has_starter:
                     raise HTTPException(
                         status_code=400,
                         detail="You already purchased the Starter plan. You can upgrade to Pro plan."
                     )
                 
-                if request.amount == 199.0 and has_starter:
+                if request.amount == PRO_PLAN_PRICE and has_starter:
                     # Allow upgrade from Starter to Pro
                     print(f"✅ Allowing upgrade from Starter to Pro")
                     pass
@@ -606,23 +624,34 @@ async def get_available_materials(user_id: str):
             result = await session.execute(stmt)
             completed_payments = result.scalars().all()
             
-            # Check which plans user has
-            has_starter = any(p.amount == 99.0 for p in completed_payments)
-            has_pro = any(p.amount == 199.0 for p in completed_payments)
+            # Check which plans user has - check current price OR historical prices
+            # This ensures users who purchased at old prices still have access
+            has_starter = any(
+                p.amount == STARTER_PLAN_PRICE or 
+                p.amount == 99.0 or 
+                abs(p.amount - 99.0) < 0.01
+                for p in completed_payments
+            )
+            has_pro = any(
+                p.amount == PRO_PLAN_PRICE or 
+                p.amount == 199.0 or 
+                abs(p.amount - 199.0) < 0.01
+                for p in completed_payments
+            )
             
             available_files = []
             
             if has_starter:
                 available_files.append({
-                    "filename": "ID.pdf",
-                    "name": "ID Document",
+                    "filename": STARTER_PLAN_FILE,
+                    "name": "Starter Plan Document",
                     "plan": "Starter"
                 })
             
             if has_pro:
                 available_files.append({
-                    "filename": "AKSHAAY.pdf",
-                    "name": "AKSHAAY Resume",
+                    "filename": PRO_PLAN_FILE,
+                    "name": "Pro Plan Document",
                     "plan": "Pro"
                 })
             
@@ -642,7 +671,7 @@ async def download_material(filename: str, user_id: str):
     """Download a material file with access control"""
     try:
         # Validate filename to prevent path traversal
-        allowed_files = ["ID.pdf", "AKSHAAY.pdf"]
+        allowed_files = [STARTER_PLAN_FILE, PRO_PLAN_FILE]
         if filename not in allowed_files:
             raise HTTPException(status_code=400, detail="Invalid file name")
         
@@ -662,21 +691,32 @@ async def download_material(filename: str, user_id: str):
             result = await session.execute(stmt)
             completed_payments = result.scalars().all()
             
-            # Check which plans user has
-            has_starter = any(p.amount == 99.0 for p in completed_payments)
-            has_pro = any(p.amount == 199.0 for p in completed_payments)
+            # Check which plans user has - check current price OR historical prices
+            # This ensures users who purchased at old prices still have access
+            has_starter = any(
+                p.amount == STARTER_PLAN_PRICE or 
+                p.amount == 99.0 or 
+                abs(p.amount - 99.0) < 0.01
+                for p in completed_payments
+            )
+            has_pro = any(
+                p.amount == PRO_PLAN_PRICE or 
+                p.amount == 199.0 or 
+                abs(p.amount - 199.0) < 0.01
+                for p in completed_payments
+            )
             
             # Check access based on file and plan
-            if filename == "ID.pdf" and not has_starter:
+            if filename == STARTER_PLAN_FILE and not has_starter:
                 raise HTTPException(
                     status_code=403,
-                    detail="Access denied. You need to purchase the Starter plan ($99) to download this file."
+                    detail=f"Access denied. You need to purchase the Starter plan (${STARTER_PLAN_PRICE}) to download this file."
                 )
             
-            if filename == "AKSHAAY.pdf" and not has_pro:
+            if filename == PRO_PLAN_FILE and not has_pro:
                 raise HTTPException(
                     status_code=403,
-                    detail="Access denied. You need to purchase the Pro plan ($199) to download this file."
+                    detail=f"Access denied. You need to purchase the Pro plan (${PRO_PLAN_PRICE}) to download this file."
                 )
             
             # File path
@@ -697,6 +737,20 @@ async def download_material(filename: str, user_id: str):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to download file: {str(e)}")
+
+@app.get("/plans/config")
+async def get_plans_config():
+    """Get plan configuration (prices and files) for frontend"""
+    return {
+        "starter_plan": {
+            "price": STARTER_PLAN_PRICE,
+            "file": STARTER_PLAN_FILE
+        },
+        "pro_plan": {
+            "price": PRO_PLAN_PRICE,
+            "file": PRO_PLAN_FILE
+        }
+    }
 
 @app.get("/")
 async def root():
